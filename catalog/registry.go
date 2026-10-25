@@ -277,14 +277,14 @@ func (r *Registry) Refresh(ctx context.Context, cfg *config.Config) (*Catalog, s
 	return compiled, fingerprint, nil
 }
 
-// RequestRefresh debounces a full rediscovery for fingerprint. A failed
-// refresh leaves the previous immutable snapshot installed.
-func (r *Registry) RequestRefresh(fingerprint string, callback func(bool)) {
+// RequestRefresh debounces a full rediscovery for fingerprint. It reports
+// whether a cached catalog was found; a failed refresh leaves that snapshot installed.
+func (r *Registry) RequestRefresh(fingerprint string, callback func(bool)) bool {
 	r.mu.Lock()
 	entry := r.entries[fingerprint]
 	if r.closed || entry == nil || entry.config == nil {
 		r.mu.Unlock()
-		return
+		return false
 	}
 	if callback != nil {
 		entry.callbacks = append(entry.callbacks, callback)
@@ -298,7 +298,7 @@ func (r *Registry) RequestRefresh(fingerprint string, callback func(bool)) {
 	if entry.refreshing {
 		entry.pending = true
 		r.mu.Unlock()
-		return
+		return true
 	}
 	if entry.timer == nil {
 		entry.timer = time.AfterFunc(refreshDebounce, func() { r.runRefresh(fingerprint) })
@@ -306,6 +306,7 @@ func (r *Registry) RequestRefresh(fingerprint string, callback func(bool)) {
 		entry.timer.Reset(refreshDebounce)
 	}
 	r.mu.Unlock()
+	return true
 }
 
 func (r *Registry) runRefresh(fingerprint string) {

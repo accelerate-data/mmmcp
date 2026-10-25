@@ -25,8 +25,8 @@ type discoveryResult struct {
 	pending  bool
 }
 
-// compile discovers cfg. With deferAuthorization, components that return 401 leave
-// a catalog that exposes only the authorization tool.
+// compile discovers cfg. With deferred authorization, components that return 401
+// remain pending; partial mode retains the healthy components' features.
 func compile(ctx context.Context, cfg *config.Config, discoverer component.Discoverer, deferAuthorization bool) (*Catalog, error) {
 	result := newCompileCatalog(cfg.ToolSearch)
 	prefixes := make([]string, len(cfg.Servers))
@@ -69,13 +69,20 @@ func compile(ctx context.Context, cfg *config.Config, discoverer component.Disco
 		}
 	}
 	if len(pending) > 0 {
-		// Ready components stay hidden until every component is authorized.
-		pendingCatalog := newCompileCatalog(false)
-		pendingCatalog.serverInfo = result.serverInfo
-		pendingCatalog.pendingAuthorization = pending
-		pendingCatalog.tools = []*mcp.Tool{authorizationTool()}
-		pendingCatalog.visibleTools = pendingCatalog.tools
-		return newCatalog(pendingCatalog)
+		if !cfg.PartialAuthorization {
+			// Ready components stay hidden until every component is authorized.
+			pendingCatalog := newCompileCatalog(false)
+			pendingCatalog.serverInfo = result.serverInfo
+			pendingCatalog.pendingAuthorization = pending
+			pendingCatalog.tools = []*mcp.Tool{authorizationTool()}
+			pendingCatalog.visibleTools = pendingCatalog.tools
+			return newCatalog(pendingCatalog)
+		}
+		result.pendingAuthorization = pending
+		result.visibleTools = append(result.visibleTools, authorizationTool())
+		if !cfg.ToolSearch {
+			result.tools = append(result.tools, authorizationTool())
+		}
 	}
 	compiled, err := newCatalog(result)
 	if err != nil || !cfg.ToolSearch {

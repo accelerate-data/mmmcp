@@ -14,7 +14,183 @@ import (
 	"github.com/obot-platform/mmmcp"
 	"github.com/obot-platform/mmmcp/catalog"
 	"github.com/obot-platform/mmmcp/config"
+	"github.com/obot-platform/mmmcp/toolsearch"
 )
+
+func TestPartialAuthorizationSearchCallsReadyComponent(t *testing.T) {
+	ready := namedToolFixture(t, "ready")
+	pending := testHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	composite, err := mmmcp.New(t.Context(), &config.Config{
+		DeferAuthorization:   true,
+		PartialAuthorization: true,
+		ToolSearch:           true,
+		Servers: []config.Server{
+			{Name: "oauth", URL: pending.URL},
+			{Name: "ready", URL: ready.URL},
+		},
+	}, mmmcp.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer composite.Close()
+	frontend := testHTTPServer(t, composite.HTTPHandler())
+	session, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, nil).Connect(
+		t.Context(), &mcp.StreamableClientTransport{Endpoint: frontend.URL, HTTPClient: frontend.Client()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := toolNameList(listed.Tools); len(got) != 3 || got[0] != toolsearch.CallToolName || got[1] != catalog.AuthorizationToolName || got[2] != toolsearch.SearchToolName {
+		t.Fatalf("visible tools = %v", got)
+	}
+	status, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: catalog.AuthorizationToolName})
+	if err != nil || status.IsError || !strings.Contains(status.Content[0].(*mcp.TextContent).Text, "oauth") {
+		t.Fatalf("pending authorization status = %+v, error = %v", status, err)
+	}
+
+	search, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: toolsearch.SearchToolName, Arguments: map[string]any{"query": "tool"},
+	})
+	if err != nil || search.IsError {
+		t.Fatalf("search = %+v, error = %v", search, err)
+	}
+	found := decodeSearchResults(t, search)
+	if len(found.Tools) != 1 || found.Tools[0].Reference.Name != "ready__tool" {
+		t.Fatalf("search results = %+v, want only ready tool", found.Tools)
+	}
+	called, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+		Name: toolsearch.CallToolName,
+		Arguments: map[string]any{
+			"name": "ready__tool", "revision": found.Tools[0].Revision, "arguments": map[string]any{},
+		},
+	})
+	if err != nil || called.IsError || called.Content[0].(*mcp.TextContent).Text != "ready" {
+		t.Fatalf("ready call = %+v, error = %v", called, err)
+	}
+}
+
+func TestPartialAuthorizationNotifiesWhenOnePendingComponentBecomesReady(t *testing.T) {
+	ready := namedToolFixture(t, "ready")
+	var firstAuthorized atomic.Bool
+	component := func(name string, authorized *atomic.Bool) string {
+		t.Helper()
+		fixture := namedToolFixture(t, name)
+		target, err := url.Parse(fixture.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		return testHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !authorized.Load() {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			proxy.ServeHTTP(w, r)
+		})).URL
+	}
+	secondAuthorized := new(atomic.Bool)
+	composite, err := mmmcp.New(t.Context(), &config.Config{
+		DeferAuthorization:   true,
+		PartialAuthorization: true,
+		Servers: []config.Server{
+			{Name: "first", URL: component("first", &firstAuthorized)},
+			{Name: "second", URL: component("second", secondAuthorized)},
+			{Name: "ready", URL: ready.URL},
+		},
+	}, mmmcp.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer composite.Close()
+	frontend := testHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		composite.HTTPHandler().ServeHTTP(w, r.WithContext(mmmcp.ContextWithConfigID(r.Context(), "user")))
+	}))
+	changed := make(chan struct{}, 1)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, &mcp.ClientOptions{
+		ToolListChangedHandler: func(context.Context, *mcp.ToolListChangedRequest) { changed <- struct{}{} },
+	})
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: frontend.URL, HTTPClient: frontend.Client()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil || len(listed.Tools) != 2 {
+		t.Fatalf("initial tools = %+v, error = %v", listed, err)
+	}
+
+	firstAuthorized.Store(true)
+	status, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: catalog.AuthorizationToolName})
+	if err != nil || status.IsError {
+		t.Fatalf("status = %+v, error = %v", status, err)
+	}
+	if text := status.Content[0].(*mcp.TextContent).Text; !strings.Contains(text, "second") || strings.Contains(text, "first") {
+		t.Fatalf("pending status after sign-in = %q", text)
+	}
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("newly authorized component did not notify the tool list while another remained pending")
+	}
+	listed, err = session.ListTools(t.Context(), nil)
+	if err != nil || len(listed.Tools) != 3 {
+		t.Fatalf("updated tools = %+v, error = %v", listed, err)
+	}
+}
+
+func TestPartialAuthorizationForwardsReadyComponentToolChanges(t *testing.T) {
+	readyServer := mcp.NewServer(&mcp.Implementation{Name: "ready", Version: "test"}, nil)
+	readyServer.AddTool(&mcp.Tool{Name: "first", InputSchema: map[string]any{"type": "object"}}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{}, nil
+	})
+	ready := testHTTPServer(t, mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return readyServer }, nil))
+	pending := testHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	composite, err := mmmcp.New(t.Context(), &config.Config{
+		DeferAuthorization: true, PartialAuthorization: true,
+		Servers: []config.Server{{Name: "ready", URL: ready.URL}, {Name: "oauth", URL: pending.URL}},
+	}, mmmcp.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer composite.Close()
+	frontend := testHTTPServer(t, composite.HTTPHandler())
+	changed := make(chan struct{}, 1)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "1"}, &mcp.ClientOptions{
+		ToolListChangedHandler: func(context.Context, *mcp.ToolListChangedRequest) { changed <- struct{}{} },
+	})
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: frontend.URL, HTTPClient: frontend.Client()}, &mcp.ClientSessionOptions{ProtocolVersion: "2025-11-25"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	listed, err := session.ListTools(t.Context(), nil)
+	if err != nil || len(listed.Tools) != 2 {
+		t.Fatalf("initial tools = %+v, error = %v", listed, err)
+	}
+	if _, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: "ready__first"}); err != nil {
+		t.Fatal(err)
+	}
+	readyServer.AddTool(&mcp.Tool{Name: "second", InputSchema: map[string]any{"type": "object"}}, func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{}, nil
+	})
+	select {
+	case <-changed:
+	case <-time.After(time.Second):
+		t.Fatal("ready component tool change was not forwarded while a sibling needed OAuth")
+	}
+	listed, err = session.ListTools(t.Context(), nil)
+	if err != nil || len(listed.Tools) != 3 {
+		t.Fatalf("updated tools = %+v, error = %v", listed, err)
+	}
+}
 
 func TestDeferredAuthorizationKeepsSessionConnected(t *testing.T) {
 	for _, protocol := range []string{"2025-11-25", "2026-07-28"} {

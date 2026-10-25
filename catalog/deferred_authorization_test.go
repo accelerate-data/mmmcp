@@ -65,6 +65,46 @@ func TestPendingAuthorizationIsNotCached(t *testing.T) {
 	}
 }
 
+func TestPartialAuthorizationKeepsReadyComponentTools(t *testing.T) {
+	d := &authDiscoverer{tool: "tool"}
+	r := NewRegistry(d)
+	defer r.Close()
+	cfg := &config.Config{
+		DeferAuthorization:   true,
+		PartialAuthorization: true,
+		Servers:              []config.Server{{Name: "oauth"}, {Name: "ready"}},
+	}
+
+	pending, _, err := r.Get(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := pending.PendingAuthorization(); len(got) != 1 || got[0] != "oauth" {
+		t.Fatalf("pending = %v, want [oauth]", got)
+	}
+	if tools := pending.Tools(); len(tools) != 2 || tools[0].Name != AuthorizationToolName || tools[1].Name != "ready__tool" {
+		t.Fatalf("pending tools = %v, want authorization and ready tools", tools)
+	}
+	if _, ok := pending.RouteTool("ready__tool"); !ok {
+		t.Fatal("ready component tool was not callable")
+	}
+	if _, ok := pending.RouteTool("oauth__tool"); ok {
+		t.Fatal("pending component tool was callable")
+	}
+
+	d.authorized.Store(true)
+	ready, _, err := r.Get(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ready.PendingAuthorization(); len(got) != 0 {
+		t.Fatalf("pending after sign-in = %v", got)
+	}
+	if _, ok := ready.RouteTool("oauth__tool"); !ok {
+		t.Fatal("component tool did not appear after sign-in")
+	}
+}
+
 func TestRefreshDoesNotDeferAuthorization(t *testing.T) {
 	d := &authDiscoverer{tool: "tool"}
 	d.authorized.Store(true)

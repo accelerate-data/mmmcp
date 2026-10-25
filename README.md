@@ -235,6 +235,15 @@ per user, attach each user's configuration with `ContextWithConfig` and make it
 differ per user, for example with a static header that identifies the user, so each
 user gets their own catalog.
 
+Set `Config.PartialAuthorization` together with `DeferAuthorization` when ready
+components must remain usable while other components return 401. Pending
+components contribute no tools, prompts, or resources; ready components remain
+listed and callable alongside `mmmcp_auth_status`. Tool search indexes the ready
+tools for each pending request, and a later request discovers newly authorized
+components without restarting the frontend session. The default defer mode above
+still hides all component features until authorization completes. Both settings
+are programmatic only.
+
 ## Storage
 
 Set storage with `Options.DSN` (or `-dsn`/`MMMCP_DSN` in the CLI). An empty DSN

@@ -35,20 +35,20 @@ type frontendBindings struct {
 }
 
 // observe retains snapshots only while a configuration has active listeners.
-func (s *configToolSubscriptions) observe(id, method string, server *mcp.Server, compiled *catalog.Catalog, fingerprint string, toolSearch bool) func() {
+func (s *configToolSubscriptions) observe(id, method string, server *mcp.Server, compiled *catalog.Catalog, fingerprint string, toolSearch, partialAuthorization bool) func() {
 	s.mu.Lock()
 	entry := s.configs[id]
-	var notify, setup []*mcp.Server
+	var notify, authorizationNotifications []*mcp.Server
 	if entry != nil {
-		setupDone := setupChanged(entry.catalog, compiled)
-		if (entry.fingerprint != fingerprint || setupDone) && (entry.toolSearch != toolSearch || !reflect.DeepEqual(entry.catalog.Tools(), compiled.Tools())) {
+		authorizationChanged := authorizationChanged(entry.catalog, compiled, partialAuthorization)
+		if (entry.fingerprint != fingerprint || authorizationChanged) && (entry.toolSearch != toolSearch || !reflect.DeepEqual(entry.catalog.Tools(), compiled.Tools())) {
 			for listener := range entry.servers {
 				notify = append(notify, listener)
 			}
 		}
-		if setupDone {
+		if authorizationChanged {
 			for listener := range entry.servers {
-				setup = append(setup, listener)
+				authorizationNotifications = append(authorizationNotifications, listener)
 			}
 		}
 		entry.catalog, entry.fingerprint, entry.toolSearch = compiled, fingerprint, toolSearch
@@ -81,8 +81,8 @@ func (s *configToolSubscriptions) observe(id, method string, server *mcp.Server,
 	for _, listener := range notify {
 		notifyFeatureChanged(listener, component.FeatureTools)
 	}
-	for _, listener := range setup {
-		notifySetupChanged(listener)
+	for _, listener := range authorizationNotifications {
+		notifyAuthorizationChanged(listener)
 	}
 	return cleanup
 }
@@ -162,7 +162,7 @@ func (c *Composite) callbacksForComponent(frontend *mcp.ServerSession, cfg *conf
 		}
 	}
 	callbacks.ListChanged = func(_ context.Context, family component.FeatureFamily) {
-		c.registry.RequestRefresh(fingerprint, func(success bool) {
+		queued := c.registry.RequestRefresh(fingerprint, func(success bool) {
 			if fingerprint == c.defaultCatalogFingerprint {
 				c.catalogDegraded.Store(!success)
 			}
@@ -173,6 +173,13 @@ func (c *Composite) callbacksForComponent(frontend *mcp.ServerSession, cfg *conf
 				notifyFeatureChanged(server, family)
 			}
 		})
+		if !queued && cfg.PartialAuthorization {
+			// Pending catalogs are uncached so each request checks its own grants.
+			// Notify active listeners to rediscover the changed ready component.
+			for _, server := range c.bindings.matching(fingerprint, componentName) {
+				notifyFeatureChanged(server, family)
+			}
+		}
 	}
 	callbacks.ResourceUpdate = func(ctx context.Context, uri string) {
 		compiled, _, err := c.registry.Get(ctx, cfg)
