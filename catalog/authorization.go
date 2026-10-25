@@ -19,7 +19,7 @@ func (c *Catalog) PendingAuthorization() []string {
 func authorizationTool() *mcp.Tool {
 	return &mcp.Tool{
 		Name:        AuthorizationToolName,
-		Description: "Configure and authenticate all MCP components before using their tools. Call this tool to request clickable setup links. After the user finishes signing in, call it again to refresh available tools without restarting the session. Opening a link is not completed authorization. Do not continuously poll.",
+		Description: "Configure and authenticate pending MCP components. Call this tool to request clickable setup links. After the user finishes signing in, call it again to refresh available tools without restarting the session. Opening a link is not completed authorization. Do not continuously poll.",
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "additionalProperties": false},
 	}
 }

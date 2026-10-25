@@ -14,9 +14,12 @@ type Config struct {
 	// Clients complete authorization out of band, then call mmmcp_auth_status.
 	// This option is programmatic only; configuration files retain normal OAuth behavior.
 	DeferAuthorization bool
-	Listen             string
-	IdleTimeout        time.Duration
-	Servers            []Server
+	// PartialAuthorization keeps healthy components visible while others need authorization.
+	// It takes effect only with DeferAuthorization and is programmatic only.
+	PartialAuthorization bool
+	Listen               string
+	IdleTimeout          time.Duration
+	Servers              []Server
 }
 
 // Server describes one component MCP server.
