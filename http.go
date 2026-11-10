@@ -25,22 +25,44 @@ func (c *Composite) newHTTPHandler(opts Options) http.Handler {
 		Logger:       opts.Logger,
 		EventStore:   c.events,
 	})
-	dispatch := &httpDispatcher{stateless: stateless, stateful: stateful}
+	dispatch := &httpDispatcher{
+		stateless: stateless,
+		stateful:  stateful,
+	}
 	bridged := c.configBridge(c.selectFrontendImplementation(c.trackHTTPActivity(dispatch)))
 	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.httpMu.Lock()
 		if c.closed.Load() {
+			c.httpMu.Unlock()
 			http.Error(w, "composite server is closed", http.StatusServiceUnavailable)
+
 			return
 		}
+		c.httpWG.Add(1)
+		c.httpMu.Unlock()
+		defer c.httpWG.Done()
+
+		// Cancel HTTP streams as well as method handlers when the composite closes.
+		ctx, cancel := context.WithCancel(r.Context())
+		stop := context.AfterFunc(c.shutdownCtx, cancel)
+		defer func() {
+			stop()
+			cancel()
+		}()
+		r = r.WithContext(ctx)
+
 		forwardedHeaders := r.Header.Clone()
 		forwardedHeaders.Del(authorizationErrorCaptureHeader)
 		r = r.WithContext(component.ContextWithRequestHeaders(r.Context(), forwardedHeaders))
 		if r.Method == http.MethodPost && !isSubscriptionsListenRequest(r) {
 			c.serveBufferedAuthorizationResponse(w, r, bridged)
+
 			return
 		}
-		bridged.ServeHTTP(w, r)
+
+		c.serveStreamingAuthorizationResponse(w, r, bridged)
 	})
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/healthz":

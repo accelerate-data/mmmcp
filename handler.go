@@ -31,38 +31,49 @@ func (c *Composite) featureMiddleware(server *mcp.Server) mcp.Middleware {
 				return nil, err
 			}
 			toolSearch := cfg.ToolSearch
-			if id, ok := ConfigIDFromContext(ctx); ok && request.GetSession().ID() == "" {
-				if cleanup := c.toolSubscriptions.observe(id, method, server, compiled, fingerprint, toolSearch, cfg.PartialAuthorization); cleanup != nil {
-					defer cleanup()
-				}
-			} else {
-				mu.Lock()
-				toolsChanged := false
-				authorizationChanged := previous != nil && authorizationChanged(previous, compiled, cfg.PartialAuthorization)
-				if previous != nil && (previousFingerprint != fingerprint || authorizationChanged) {
-					// In direct mode, compare definitions after frontend schema omission:
-					// an upstream protocol change can hide or restore output schemas even
-					// when the raw tool definitions are unchanged. Project each snapshot
-					// using its own upstream versions to detect that visible change.
-					previousTools := previous.Tools()
-					if !previousToolSearch {
-						previousTools = omitModernToolOutputSchemas(request, previousTools, previous)
+
+			// A partial catalog does not describe additions or removals in the full tool list.
+			// Deferred calls retain all components so authorization completion can notify clients.
+			// Scoped prompts/list and resources/list skip this block on purpose: they observe
+			// neither tool definitions nor authorization state, so a later tools/list or
+			// deferred tools/call reports any authorization change instead.
+			fullTools := !cfg.RequestScopedDiscovery || method == "tools/list" || method == subscriptionsListenMethod ||
+				cfg.DeferAuthorization && method == "tools/call"
+			if fullTools {
+				if id, ok := ConfigIDFromContext(ctx); ok && request.GetSession().ID() == "" {
+					if cleanup := c.toolSubscriptions.observe(id, method, server, compiled, fingerprint, toolSearch, cfg.PartialAuthorization); cleanup != nil {
+						defer cleanup()
 					}
-					currentTools := compiled.Tools()
-					if !toolSearch {
-						currentTools = omitModernToolOutputSchemas(request, currentTools, compiled)
+				} else {
+					mu.Lock()
+					toolsChanged := false
+					authorizationChanged := previous != nil && authorizationChanged(previous, compiled, cfg.PartialAuthorization)
+					if previous != nil && (previousFingerprint != fingerprint || authorizationChanged) {
+						// In direct mode, compare definitions after frontend schema omission:
+						// an upstream protocol change can hide or restore output schemas even
+						// when the raw tool definitions are unchanged. Project each snapshot
+						// using its own upstream versions to detect that visible change.
+						previousTools := previous.Tools()
+						if !previousToolSearch {
+							previousTools = omitModernToolOutputSchemas(request, previousTools, previous)
+						}
+						currentTools := compiled.Tools()
+						if !toolSearch {
+							currentTools = omitModernToolOutputSchemas(request, currentTools, compiled)
+						}
+						toolsChanged = previousToolSearch != toolSearch || !reflect.DeepEqual(previousTools, currentTools)
 					}
-					toolsChanged = previousToolSearch != toolSearch || !reflect.DeepEqual(previousTools, currentTools)
-				}
-				previous, previousFingerprint, previousToolSearch = compiled, fingerprint, toolSearch
-				mu.Unlock()
-				if toolsChanged && method != "tools/list" {
-					notifyFeatureChanged(server, component.FeatureTools)
-				}
-				if authorizationChanged {
-					notifyAuthorizationChanged(server)
+					previous, previousFingerprint, previousToolSearch = compiled, fingerprint, toolSearch
+					mu.Unlock()
+					if toolsChanged && method != "tools/list" {
+						notifyFeatureChanged(server, component.FeatureTools)
+					}
+					if authorizationChanged {
+						notifyAuthorizationChanged(server)
+					}
 				}
 			}
+
 			switch method {
 			case "tools/list":
 				req, ok := request.(*mcp.ListToolsRequest)
@@ -76,6 +87,7 @@ func (c *Composite) featureMiddleware(server *mcp.Server) mcp.Middleware {
 				if err != nil {
 					return nil, err
 				}
+
 				// Available tools depend on the request's selected configuration.
 				return &mcp.ListToolsResult{
 					CacheScope: "private",
@@ -125,11 +137,11 @@ func (c *Composite) featureMiddleware(server *mcp.Server) mcp.Middleware {
 				if req, ok := request.(*mcp.CallToolRequest); ok && cfg.DeferAuthorization && req.Params != nil && req.Params.Name == catalog.AuthorizationToolName {
 					return normalizeCallToolResult(request, c.authorizationStatus(ctx, compiled), "")
 				}
-				return c.callTool(ctx, request, compiled, fingerprint)
+				return c.callTool(ctx, request, compiled)
 			case "prompts/get":
-				return c.getPrompt(ctx, request, compiled, fingerprint)
+				return c.getPrompt(ctx, request, compiled)
 			case "resources/read":
-				return c.readResource(ctx, request, compiled, fingerprint)
+				return c.readResource(ctx, request, compiled)
 			default:
 				return next(ctx, method, request)
 			}
@@ -172,7 +184,11 @@ func (c *Composite) catalogForRequest(ctx context.Context, request mcp.Request) 
 		}
 	}
 	if compiled == nil {
-		compiled, fingerprint, err = c.registry.Get(ctx, c.configForRequest(ctx, request))
+		cfg := c.configForRequest(ctx, request)
+		if call, ok := request.(*mcp.CallToolRequest); ok && call.Params != nil {
+			cfg = c.requestCatalogConfig(cfg, "tools/call", call.Params.Name, call.Params.Arguments)
+		}
+		compiled, fingerprint, err = c.registry.Get(ctx, cfg)
 	}
 	if call, ok := request.(*mcp.CallToolRequest); err == nil && ok && call.Params != nil && call.Params.Name == toolsearch.SearchToolName {
 		// Pending catalogs are intentionally not cached, so build their search
@@ -194,7 +210,7 @@ func (c *Composite) configForRequest(ctx context.Context, request mcp.Request) *
 	return effectiveConfig(ctx, c.defaultConfig)
 }
 
-func (c *Composite) callTool(ctx context.Context, request mcp.Request, compiled *catalog.Catalog, fingerprint string) (mcp.Result, error) {
+func (c *Composite) callTool(ctx context.Context, request mcp.Request, compiled *catalog.Catalog) (mcp.Result, error) {
 	req, ok := request.(*mcp.CallToolRequest)
 	if !ok || req.Params == nil {
 		return nil, invalidRequest("tools/call")
@@ -218,7 +234,7 @@ func (c *Composite) callTool(ctx context.Context, request mcp.Request, compiled 
 		InputResponses: req.Params.InputResponses,
 		RequestState:   req.Params.RequestState,
 	}
-	result, err := invoke(ctx, c, request, fingerprint, route.Component,
+	result, err := invoke(ctx, c, request, route.Component,
 		func(invoker component.Invoker) (*mcp.CallToolResult, error) {
 			return invoker.CallTool(ctx, route.Component, params)
 		},
@@ -231,7 +247,7 @@ func (c *Composite) callTool(ctx context.Context, request mcp.Request, compiled 
 	return normalizeCallToolResult(request, compiled.RewriteCallToolResult(route.Prefix, result), route.ProtocolVersion)
 }
 
-func (c *Composite) getPrompt(ctx context.Context, request mcp.Request, compiled *catalog.Catalog, fingerprint string) (mcp.Result, error) {
+func (c *Composite) getPrompt(ctx context.Context, request mcp.Request, compiled *catalog.Catalog) (mcp.Result, error) {
 	req, ok := request.(*mcp.GetPromptRequest)
 	if !ok || req.Params == nil {
 		return nil, invalidRequest("prompts/get")
@@ -243,7 +259,7 @@ func (c *Composite) getPrompt(ctx context.Context, request mcp.Request, compiled
 	params := *req.Params
 	params.Name = route.OriginalName
 	params.Meta = component.DownstreamMeta(params.Meta)
-	result, err := invoke(ctx, c, request, fingerprint, route.Component,
+	result, err := invoke(ctx, c, request, route.Component,
 		func(invoker component.Invoker) (*mcp.GetPromptResult, error) {
 			return invoker.GetPrompt(ctx, route.Component, &params)
 		},
@@ -256,7 +272,7 @@ func (c *Composite) getPrompt(ctx context.Context, request mcp.Request, compiled
 	return normalizeGetPromptResult(request, compiled.RewriteGetPromptResult(route.Prefix, result))
 }
 
-func (c *Composite) readResource(ctx context.Context, request mcp.Request, compiled *catalog.Catalog, fingerprint string) (mcp.Result, error) {
+func (c *Composite) readResource(ctx context.Context, request mcp.Request, compiled *catalog.Catalog) (mcp.Result, error) {
 	req, ok := request.(*mcp.ReadResourceRequest)
 	if !ok || req.Params == nil {
 		return nil, invalidRequest("resources/read")
@@ -268,7 +284,7 @@ func (c *Composite) readResource(ctx context.Context, request mcp.Request, compi
 	params := *req.Params
 	params.URI = route.OriginalURI
 	params.Meta = component.DownstreamMeta(params.Meta)
-	result, err := invoke(ctx, c, request, fingerprint, route.Component,
+	result, err := invoke(ctx, c, request, route.Component,
 		func(invoker component.Invoker) (*mcp.ReadResourceResult, error) {
 			return invoker.ReadResource(ctx, route.Component, &params)
 		},
@@ -286,7 +302,7 @@ func (c *Composite) subscribe(ctx context.Context, req *mcp.SubscribeRequest) (e
 	if req == nil || req.Params == nil {
 		return invalidRequest("resources/subscribe")
 	}
-	compiled, fingerprint, err := c.catalogForRequest(ctx, req)
+	compiled, _, err := c.catalogForRequest(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -298,8 +314,7 @@ func (c *Composite) subscribe(ctx context.Context, req *mcp.SubscribeRequest) (e
 	params.URI = route.OriginalURI
 	params.Meta = component.DownstreamMeta(params.Meta)
 	if req.Session != nil && req.Session.ID() != "" {
-		cfg := c.configForRequest(ctx, req)
-		runtime, release, err := c.pool.Acquire(ctx, req.Session, fingerprint, route.Component, c.runtimeOptions(req.Session, cfg, fingerprint, route.Component, route.Prefix, 0))
+		runtime, release, err := c.acquireRuntime(ctx, req, req.Session, route.Component, route.Prefix, 0)
 		if err != nil {
 			return err
 		}
@@ -314,7 +329,7 @@ func (c *Composite) unsubscribe(ctx context.Context, req *mcp.UnsubscribeRequest
 	if req == nil || req.Params == nil {
 		return invalidRequest("resources/unsubscribe")
 	}
-	compiled, fingerprint, err := c.catalogForRequest(ctx, req)
+	compiled, _, err := c.catalogForRequest(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -326,8 +341,7 @@ func (c *Composite) unsubscribe(ctx context.Context, req *mcp.UnsubscribeRequest
 	params.URI = route.OriginalURI
 	params.Meta = component.DownstreamMeta(params.Meta)
 	if req.Session != nil && req.Session.ID() != "" {
-		cfg := c.configForRequest(ctx, req)
-		runtime, release, err := c.pool.Acquire(ctx, req.Session, fingerprint, route.Component, c.runtimeOptions(req.Session, cfg, fingerprint, route.Component, route.Prefix, 0))
+		runtime, release, err := c.acquireRuntime(ctx, req, req.Session, route.Component, route.Prefix, 0)
 		if err != nil {
 			return err
 		}
@@ -337,11 +351,10 @@ func (c *Composite) unsubscribe(ctx context.Context, req *mcp.UnsubscribeRequest
 	return c.factory.Unsubscribe(ctx, route.Component, &params)
 }
 
-func invoke[T any](ctx context.Context, c *Composite, request mcp.Request, fingerprint string, server config.Server, stateless func(component.Invoker) (T, error), stateful func(component.Runtime) (T, error), prefix string) (T, error) {
+func invoke[T any](ctx context.Context, c *Composite, request mcp.Request, server config.Server, stateless func(component.Invoker) (T, error), stateful func(component.Runtime) (T, error), prefix string) (T, error) {
 	if frontend, ok := request.GetSession().(*mcp.ServerSession); ok && frontend.ID() != "" {
 		frontendActivity := c.bindFrontendActivity(frontend)
-		cfg := c.configForRequest(ctx, request)
-		runtime, release, err := c.pool.Acquire(ctx, frontend, fingerprint, server, c.runtimeOptions(frontend, cfg, fingerprint, server, prefix, frontendActivity))
+		runtime, release, err := c.acquireRuntime(ctx, request, frontend, server, prefix, frontendActivity)
 		if err != nil {
 			var zero T
 			return zero, err
@@ -350,6 +363,23 @@ func invoke[T any](ctx context.Context, c *Composite, request mcp.Request, finge
 		return stateful(runtime)
 	}
 	return stateless(c.factory)
+}
+
+// Discovery selection changes catalog contents, not the user's upstream session.
+func (c *Composite) acquireRuntime(ctx context.Context, request mcp.Request, frontend *mcp.ServerSession, server config.Server, prefix string, activity int) (component.Runtime, func(), error) {
+	cfg := c.configForRequest(ctx, request)
+	if extra := request.GetExtra(); extra != nil && extra.Header != nil {
+		if selection, ok := c.requestConfigs.get(extra.Header.Get(privateConfigHeader)); ok && selection.runtimeConfig != nil {
+			cfg = selection.runtimeConfig
+		}
+	}
+
+	fingerprint, err := catalog.Fingerprint(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return c.pool.Acquire(ctx, frontend, fingerprint, server, c.runtimeOptions(frontend, cfg, fingerprint, server, prefix, activity))
 }
 
 func (c *Composite) runtimeOptions(frontend *mcp.ServerSession, cfg *config.Config, fingerprint string, server config.Server, prefix string, frontendActivity int) component.RuntimeOptions {
