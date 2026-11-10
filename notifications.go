@@ -2,6 +2,7 @@ package mmmcp
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"sync"
 
@@ -32,6 +33,8 @@ type frontendBindings struct {
 	mu       sync.Mutex
 	sessions map[*mcp.ServerSession]map[frontendBinding]struct{}
 	servers  map[*mcp.ServerSession]*mcp.Server
+	watched  map[*mcp.ServerSession]struct{}
+	wg       sync.WaitGroup
 }
 
 // observe retains snapshots only while a configuration has active listeners.
@@ -91,12 +94,61 @@ func (b *frontendBindings) bindServer(session *mcp.ServerSession, server *mcp.Se
 	if session == nil || server == nil {
 		return
 	}
+
+	// Sessions without IDs do not use persistent component runtimes.
+	if session.ID() == "" {
+		return
+	}
+
 	b.mu.Lock()
 	if b.servers == nil {
 		b.servers = make(map[*mcp.ServerSession]*mcp.Server)
 	}
 	b.servers[session] = server
+
+	// Watch the session lifetime even when its last component runtime unbinds.
+	_, watched := b.watched[session]
+	if !watched {
+		if b.watched == nil {
+			b.watched = make(map[*mcp.ServerSession]struct{})
+		}
+		b.watched[session] = struct{}{}
+		b.wg.Add(1)
+	}
 	b.mu.Unlock()
+
+	if !watched {
+		go func() {
+			defer b.wg.Done()
+
+			// Wait outside the lock so live sessions can keep updating bindings.
+			_ = session.Wait()
+
+			b.mu.Lock()
+			delete(b.servers, session)
+			delete(b.sessions, session)
+			delete(b.watched, session)
+			b.mu.Unlock()
+		}()
+	}
+}
+
+// close runs after HTTP admission stops and all admitted requests return.
+func (b *frontendBindings) close() error {
+	b.mu.Lock()
+	sessions := make([]*mcp.ServerSession, 0, len(b.watched))
+	for session := range b.watched {
+		sessions = append(sessions, session)
+	}
+	b.mu.Unlock()
+
+	var result error
+	for _, session := range sessions {
+		result = errors.Join(result, session.Close())
+	}
+	b.wg.Wait()
+
+	return result
 }
 
 func (b *frontendBindings) bind(session *mcp.ServerSession, fingerprint, componentName string) {
@@ -144,6 +196,15 @@ func (c *Composite) bindFrontendServer(server *mcp.Server) mcp.Middleware {
 			if frontend, ok := req.GetSession().(*mcp.ServerSession); ok {
 				c.bindings.bindServer(frontend, server)
 			}
+
+			// Legacy HTTP sessions detach request cancellation in the SDK.
+			ctx, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(c.shutdownCtx, cancel)
+			defer func() {
+				stop()
+				cancel()
+			}()
+
 			return next(ctx, method, req)
 		}
 	}
@@ -162,6 +223,15 @@ func (c *Composite) callbacksForComponent(frontend *mcp.ServerSession, cfg *conf
 		}
 	}
 	callbacks.ListChanged = func(_ context.Context, family component.FeatureFamily) {
+		if cfg.RequestScopedDiscovery {
+			c.registry.InvalidateComponent(componentName)
+			for _, server := range c.bindings.matching(fingerprint, componentName) {
+				notifyFeatureChanged(server, family)
+			}
+
+			return
+		}
+
 		queued := c.registry.RequestRefresh(fingerprint, func(success bool) {
 			if fingerprint == c.defaultCatalogFingerprint {
 				c.catalogDegraded.Store(!success)
@@ -182,7 +252,8 @@ func (c *Composite) callbacksForComponent(frontend *mcp.ServerSession, cfg *conf
 		}
 	}
 	callbacks.ResourceUpdate = func(ctx context.Context, uri string) {
-		compiled, _, err := c.registry.Get(ctx, cfg)
+		resourceConfig := c.requestCatalogConfig(cfg, "resources/list", "", nil)
+		compiled, _, err := c.registry.Get(ctx, resourceConfig)
 		if err != nil {
 			return
 		}
