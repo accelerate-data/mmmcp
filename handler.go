@@ -34,6 +34,9 @@ func (c *Composite) featureMiddleware(server *mcp.Server) mcp.Middleware {
 
 			// A partial catalog does not describe additions or removals in the full tool list.
 			// Deferred calls retain all components so authorization completion can notify clients.
+			// Scoped prompts/list and resources/list skip this block on purpose: they observe
+			// neither tool definitions nor authorization state, so a later tools/list or
+			// deferred tools/call reports any authorization change instead.
 			fullTools := !cfg.RequestScopedDiscovery || method == "tools/list" || method == subscriptionsListenMethod ||
 				cfg.DeferAuthorization && method == "tools/call"
 			if fullTools {
